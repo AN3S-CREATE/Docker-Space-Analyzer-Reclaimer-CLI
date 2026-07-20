@@ -1,0 +1,20 @@
+[Unit]
+Description=Docker Disk Toolkit — {{ action }}
+Documentation=https://github.com/andriesl/docker-disk-toolkit
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart={{ exec_path }} {{ args }}
+{% if working_dir %}WorkingDirectory={{ working_dir }}
+{% endif %}Nice=10
+IOSchedulingClass=idle
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={{ report_dir }}
+NoNewPrivileges=true
+{% for key, value in env.items() %}Environment="{{ key }}={{ value }}"
+{% endfor %}
+[Install]
+WantedBy=default.target

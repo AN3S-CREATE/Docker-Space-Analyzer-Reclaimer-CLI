@@ -1,0 +1,4 @@
+# Docker Disk Toolkit — {{ action }}
+# Install: crontab -e  (paste the line below), or:  (crontab -l; echo '<line>') | crontab -
+# Logs to {{ report_dir }}/cron.log
+{{ cron_expr }} {{ exec_path }} {{ args }} >> {{ report_dir }}/cron.log 2>&1

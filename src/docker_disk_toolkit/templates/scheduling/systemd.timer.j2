@@ -1,0 +1,12 @@
+[Unit]
+Description=Docker Disk Toolkit timer — {{ action }}
+Documentation=https://github.com/andriesl/docker-disk-toolkit
+
+[Timer]
+OnCalendar={{ oncalendar }}
+Persistent=true
+RandomizedDelaySec=300
+Unit={{ unit_name }}.service
+
+[Install]
+WantedBy=timers.target
