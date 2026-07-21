@@ -7,7 +7,7 @@ the CommandRunner fixture seam.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -123,8 +123,8 @@ class TestTimeParsing:
         assert utils.parse_docker_time("not a date") is None
 
     def test_age(self) -> None:
-        now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
-        when = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+        when = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
         assert utils.age(when, now=now) == timedelta(days=1)
         assert utils.age(None) is None
 

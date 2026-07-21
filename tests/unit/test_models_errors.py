@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -112,7 +112,7 @@ class TestDiagnosticReport:
     def test_json_roundtrip_keeps_bytes_as_int(self) -> None:
         report = DiagnosticReport(
             correlation_id="cid1",
-            generated_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            generated_at=datetime(2026, 7, 20, tzinfo=UTC),
             hostname="host",
             os="Linux",
             docker_probe=self._probe(),
@@ -135,12 +135,14 @@ class TestDiagnosticReport:
     def test_docker_root_disk_selection(self) -> None:
         report = DiagnosticReport(
             correlation_id="c",
-            generated_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            generated_at=datetime(2026, 7, 20, tzinfo=UTC),
             hostname="h",
             os="o",
             docker_probe=self._probe(),
             disks=[
-                DiskUsage(mountpoint="C:", total_bytes=1, used_bytes=0, free_bytes=1, percent_used=0),
+                DiskUsage(
+                    mountpoint="C:", total_bytes=1, used_bytes=0, free_bytes=1, percent_used=0
+                ),
                 DiskUsage(
                     mountpoint="/var",
                     total_bytes=1,
@@ -163,7 +165,7 @@ class TestCleanupModels:
     def test_cleanup_result_reclaimed_bytes(self) -> None:
         plan = CleanupPlan(level=PruneLevel.SAFE)
         removed = AuditEvent(
-            ts=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            ts=datetime(2026, 7, 20, tzinfo=UTC),
             run_id="r",
             level=PruneLevel.SAFE,
             dry_run=False,
@@ -186,7 +188,7 @@ class TestCleanupModels:
     def test_dry_run_reclaims_zero(self) -> None:
         plan = CleanupPlan(level=PruneLevel.SAFE)
         event = AuditEvent(
-            ts=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            ts=datetime(2026, 7, 20, tzinfo=UTC),
             run_id="r",
             level=PruneLevel.SAFE,
             dry_run=True,
