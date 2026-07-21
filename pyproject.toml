@@ -109,7 +109,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["B011", "E501"]
+# Tests favour readability over some lint rules (blind excepts, dict() literals,
+# long fixture lines, unused unpacks).
+"tests/**" = ["B011", "B017", "C408", "RUF059", "E501"]
+# Playbooks embed multi-line shell/PowerShell scripts that exceed the line limit.
+"src/docker_disk_toolkit/playbooks/*.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["docker_disk_toolkit"]

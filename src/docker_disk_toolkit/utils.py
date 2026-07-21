@@ -17,6 +17,7 @@ Sizing conventions (important):
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -25,12 +26,10 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Protocol
-
-import json
+from typing import Any, Protocol
 
 # ---------------------------------------------------------------------------
 # Errors local to parsing (kept as ValueError subclasses so utils stays a leaf)
@@ -110,7 +109,8 @@ def parse_size(value: str | int | float | None, *, default_binary: bool = False)
         raise SizeParseError(f"unknown size unit {unit_raw!r} in {value!r}")
 
     base = 1024 if (binary or default_binary) else 1000
-    return round(number * (base**power))
+    multiplier: int = base**power
+    return round(number * multiplier)
 
 
 _DECIMAL_UNITS = ["B", "kB", "MB", "GB", "TB", "PB", "EB"]
@@ -226,7 +226,7 @@ def parse_docker_time(value: str | None) -> datetime | None:
     iso = re.sub(r"(\.\d{6})\d+", r"\1", iso)
     try:
         parsed = datetime.fromisoformat(iso)
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     except ValueError:
         pass
 
@@ -235,7 +235,7 @@ def parse_docker_time(value: str | None) -> datetime | None:
     for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S"):
         try:
             parsed = datetime.strptime(stripped, fmt)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
         except ValueError:
             continue
     return None
@@ -245,9 +245,9 @@ def age(when: datetime | None, *, now: datetime | None = None) -> timedelta | No
     """Return the age (now - when) of a timestamp, or ``None`` if unknown."""
     if when is None:
         return None
-    reference = now or datetime.now(timezone.utc)
+    reference = now or datetime.now(UTC)
     if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
+        when = when.replace(tzinfo=UTC)
     return reference - when
 
 
@@ -454,7 +454,7 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(content, encoding=encoding)
-    os.replace(tmp, path)
+    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +462,7 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
 # ---------------------------------------------------------------------------
 
 
-def iter_ndjson(text: str) -> Iterator[dict]:
+def iter_ndjson(text: str) -> Iterator[dict[str, Any]]:
     """Yield JSON objects from newline-delimited JSON, tolerating noise.
 
     Docker occasionally prints a deprecation/warning line to stdout alongside
@@ -635,7 +635,9 @@ class FixtureCommandRunner:
 
 def result(stdout: str = "", *, returncode: int = 0, stderr: str = "") -> CommandResult:
     """Convenience factory for building fixture :class:`CommandResult` objects."""
-    return CommandResult(argv=[], returncode=returncode, stdout=stdout, stderr=stderr, duration_s=0.0)
+    return CommandResult(
+        argv=[], returncode=returncode, stdout=stdout, stderr=stderr, duration_s=0.0
+    )
 
 
 _DEFAULT_RUNNER: SubprocessRunner | None = None
