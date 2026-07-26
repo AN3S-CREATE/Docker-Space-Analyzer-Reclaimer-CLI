@@ -25,6 +25,7 @@ import sys
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
@@ -501,6 +502,99 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(content, encoding=encoding)
     tmp.replace(path)
+
+
+def ensure_private_dir(path: Path) -> Path:
+    """Create ``path`` (and parents) restricted to the invoking user.
+
+    Reports and the audit log record Docker object names — image tags, volume
+    and container names — which routinely embed customer, project or personal
+    identifiers. On a shared host the default ``0o755`` would expose them to
+    every local account, so the directory is created ``0o700`` and an existing
+    directory is tightened.
+
+    ``mkdir(mode=...)`` is subject to the umask and only applies to a directory
+    it actually creates, hence the explicit :meth:`~pathlib.Path.chmod`. This is
+    a no-op on Windows, where POSIX mode bits are not meaningful and NTFS
+    inherits ACLs from the parent instead.
+    """
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        # Best effort: a foreign filesystem or a dir owned by another user
+        # cannot be tightened, and that must not fail the run.
+        with suppress(OSError):
+            path.chmod(0o700)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Cross-process file locking (audit trail integrity)
+# ---------------------------------------------------------------------------
+
+LOCK_TIMEOUT_S = 10.0
+_LOCK_POLL_S = 0.05
+
+
+class FileLockTimeout(OSError):
+    """Raised when an exclusive file lock could not be acquired in time."""
+
+
+if sys.platform == "win32":  # pragma: no cover - platform specific
+    import msvcrt
+
+    def _lock_acquire(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _lock_release(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:  # pragma: no cover - platform specific
+    import fcntl
+
+    def _lock_acquire(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _lock_release(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def file_lock(target: Path, *, timeout_s: float = LOCK_TIMEOUT_S) -> Iterator[None]:
+    """Hold a cross-process exclusive lock associated with ``target``.
+
+    The audit trail is append-only and is written by both scheduled and
+    interactive runs. A multi-line append is *not* atomic, so without a lock two
+    overlapping runs can interleave their records and corrupt the very log the
+    safety story depends on.
+
+    Locking is done on a sidecar ``<name>.lock`` file so the data file's
+    contents and file position are never disturbed. The lock is advisory, which
+    suffices because every writer in this toolkit goes through this helper.
+
+    Raises:
+        FileLockTimeout: If the lock is still held after ``timeout_s``.
+    """
+    lock_path = target.with_name(target.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_s
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        while True:
+            try:
+                _lock_acquire(fd)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise FileLockTimeout(f"could not lock {target} within {timeout_s}s") from exc
+                time.sleep(_LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            _lock_release(fd)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------

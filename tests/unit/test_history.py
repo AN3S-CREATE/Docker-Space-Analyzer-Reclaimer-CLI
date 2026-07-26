@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -148,3 +149,26 @@ class TestConcurrency:
         assert not errors, f"concurrent writers raised: {errors!r}"
         stats = history.trend(db_path=db, window=timedelta(days=30), now=NOW)
         assert stats.runs == 30
+
+    def test_concurrent_writers_do_not_interleave_jsonl(self, tmp_path: Path) -> None:
+        """Every line must be complete JSON — the audit story depends on it."""
+        jsonl, db = _paths(tmp_path)
+
+        def writer(prefix: str) -> None:
+            for i in range(10):
+                history.record_run(
+                    _result(f"{prefix}{i}", 1_000_000), jsonl_path=jsonl, db_path=db, ts=NOW
+                )
+
+        threads = [threading.Thread(target=writer, args=(p,)) for p in ("a", "b", "c")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        lines = [ln for ln in jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) == 30
+        run_ids = set()
+        for line in lines:
+            run_ids.add(json.loads(line)["run_id"])  # raises if a line is torn
+        assert len(run_ids) == 30

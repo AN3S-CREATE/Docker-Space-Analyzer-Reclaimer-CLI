@@ -15,12 +15,37 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
+from rich.text import Text
+from typer.core import TyperGroup
+
+# Typer >= 0.13 vendors its own Click fork, so the exceptions it raises for
+# control flow are NOT instances of the upstream ``click.exceptions`` classes
+# (``typer.Exit`` derives from ``RuntimeError``). Resolve them from Typer, and
+# fall back to upstream Click for older releases. ``TestExitCodeContract`` fails
+# loudly if a Typer upgrade ever breaks this coupling.
+#
+# Type-checking deliberately sees the upstream Click classes: the two forks are
+# structurally identical, and upstream is the one that ships stubs.
+if TYPE_CHECKING:
+    from click.exceptions import Abort as _Abort
+    from click.exceptions import Exit as _Exit
+    from click.exceptions import UsageError as _UsageError
+else:
+    try:
+        from typer._click.exceptions import Abort as _Abort
+        from typer._click.exceptions import Exit as _Exit
+        from typer._click.exceptions import UsageError as _UsageError
+    except ImportError:  # pragma: no cover - Typer built on upstream Click
+        from click.exceptions import Abort as _Abort
+        from click.exceptions import Exit as _Exit
+        from click.exceptions import UsageError as _UsageError
 
 from . import cleaner, history, reporters, scheduling
 from .analyzer import analyze as run_analyze
@@ -30,14 +55,68 @@ from .errors import ExitCode, ToolkitError
 from .models import CleanupPlan, CleanupResult, HealthStatus, PruneLevel
 from .utils import humanize_size, is_tty, new_run_id, parse_duration
 
+_err_console = Console(stderr=True)
+
+
+def _unexpected_panel(exc: BaseException) -> Panel:
+    """Render an unhandled exception as an actionable panel, not a traceback."""
+    body = Text()
+    body.append(f"{type(exc).__name__}: {exc}", style="bold red")
+    body.append("\n\n")
+    body.append("How to fix: ", style="bold yellow")
+    body.append(
+        "This is an unexpected internal error. Re-run with -v to capture a full "
+        "traceback and report it at "
+        "https://github.com/andriesl/docker-disk-toolkit/issues"
+    )
+    return Panel(body, title="[red]UnexpectedError[/red]", border_style="red", expand=False)
+
+
+class _BoundaryGroup(TyperGroup):
+    """Enforces the documented exit-code contract at the CLI boundary.
+
+    Every terminal outcome must be one of the four codes in
+    :class:`~docker_disk_toolkit.errors.ExitCode`. Without this group an
+    unhandled exception escapes as a bare traceback and Python exits ``1`` —
+    which is :attr:`ExitCode.WARNING_CLEANED`, i.e. indistinguishable from a
+    *successful* cleanup to any cron or systemd job watching the status. Click's
+    own usage errors likewise default to ``2``, colliding with
+    :attr:`ExitCode.CRITICAL`.
+    """
+
+    def invoke(self, ctx: Any) -> Any:
+        try:
+            return super().invoke(ctx)
+        except (_Exit, _Abort):
+            raise  # deliberate control flow carrying its own code
+        except _UsageError as exc:
+            exc.show()
+            raise typer.Exit(int(ExitCode.FATAL)) from exc
+        except ToolkitError as exc:
+            _err_console.print(exc.rich_panel())
+            raise typer.Exit(int(exc.exit_code)) from exc
+        except Exception as exc:
+            _err_console.print(_unexpected_panel(exc))
+            raise typer.Exit(int(ExitCode.FATAL)) from exc
+
+    def make_context(self, *args: Any, **kwargs: Any) -> Any:
+        # Top-level parsing happens before invoke(), so remap here too. A
+        # malformed invocation is a tool error that could not complete, which
+        # the specification classifies as FATAL rather than CRITICAL.
+        try:
+            return super().make_context(*args, **kwargs)
+        except _UsageError as exc:
+            exc.show()
+            raise typer.Exit(int(ExitCode.FATAL)) from exc
+
+
 app = typer.Typer(
     name="docker-disk",
+    cls=_BoundaryGroup,
     help="Analyze Docker disk usage, reclaim space safely, and prevent recurrence.",
     no_args_is_help=False,
     add_completion=False,
 )
-
-_err_console = Console(stderr=True)
 
 _HEALTH_EXIT = {
     HealthStatus.HEALTHY: ExitCode.HEALTHY,

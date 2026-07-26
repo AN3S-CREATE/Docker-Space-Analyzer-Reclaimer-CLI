@@ -21,6 +21,7 @@ from docker_disk_toolkit.models import (
     HealthStatus,
     MonitorReading,
 )
+from docker_disk_toolkit.monitor import OsaScriptNotifier
 from docker_disk_toolkit.utils import FixtureCommandRunner, result
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
@@ -213,3 +214,134 @@ class TestCheckOnce:
         ctx = ctx_factory("not-installed")
         readings = monitor.watch(ctx, interval_seconds=0, max_iterations=3, sleep_fn=lambda s: None)
         assert len(readings) == 3
+
+
+class _FakeResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+class TestWebhookNotifier:
+    """The webhook was configured and documented but never actually sent."""
+
+    def _notifier(self, responses: list[object], **kwargs) -> tuple[monitor.WebhookNotifier, list]:
+        calls: list = []
+
+        def opener(request, timeout=None):
+            calls.append((request, timeout))
+            outcome = responses[min(len(calls) - 1, len(responses) - 1)]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        notifier = monitor.WebhookNotifier(
+            "https://hooks.example.com/abc",
+            opener=opener,
+            sleep_fn=lambda _s: None,
+            **kwargs,
+        )
+        return notifier, calls
+
+    def test_posts_json_payload(self) -> None:
+        notifier, calls = self._notifier([_FakeResponse(200)])
+        assert notifier.send("Docker disk CRITICAL", "2 GB free", "critical") is True
+        request, timeout = calls[0]
+        assert request.method == "POST"
+        assert request.get_header("Content-type") == "application/json"
+        assert timeout == monitor.WEBHOOK_TIMEOUT_S
+        body = json.loads(request.data.decode("utf-8"))
+        assert body["severity"] == "critical"
+        assert "2 GB free" in body["text"]
+
+    def test_retries_then_succeeds(self) -> None:
+        notifier, calls = self._notifier([OSError("connection refused"), _FakeResponse(200)])
+        assert notifier.send("t", "b", "critical") is True
+        assert len(calls) == 2
+
+    def test_gives_up_after_configured_attempts(self) -> None:
+        notifier, calls = self._notifier([OSError("down")], attempts=3)
+        assert notifier.send("t", "b", "critical") is False
+        assert len(calls) == 3
+
+    def test_non_2xx_is_failure(self) -> None:
+        notifier, _ = self._notifier([_FakeResponse(500)], attempts=1)
+        assert notifier.send("t", "b", "critical") is False
+
+    def test_never_raises_so_log_sink_still_runs(self) -> None:
+        notifier, _ = self._notifier([RuntimeError("boom")], attempts=1)
+        assert notifier.send("t", "b", "critical") is False
+
+    def test_composite_includes_webhook_when_configured(self) -> None:
+        config = NotificationConfig(
+            enabled=True, webhook_url="https://hooks.example.com/abc", desktop=False
+        )
+        composite = monitor.get_notifier(config)
+        assert composite._webhook is not None
+
+    def test_composite_omits_webhook_when_unset(self) -> None:
+        composite = monitor.get_notifier(NotificationConfig(enabled=True, desktop=False))
+        assert composite._webhook is None
+
+
+class TestWebhookUrlValidation:
+    @pytest.mark.parametrize(
+        "url", ["file:///etc/passwd", "ftp://example.com/x", "not-a-url", "//example.com"]
+    )
+    def test_rejects_non_http_schemes(self, url: str) -> None:
+        with pytest.raises(Exception):
+            NotificationConfig(webhook_url=url)
+
+    @pytest.mark.parametrize("url", ["http://localhost:9000/hook", "https://hooks.slack.com/x"])
+    def test_accepts_http_and_https(self, url: str) -> None:
+        assert NotificationConfig(webhook_url=url).webhook_url is not None
+
+    def test_error_message_does_not_leak_the_url(self) -> None:
+        secret = "ftp://user:pa55w0rd@internal.example.com/hook"
+        with pytest.raises(Exception) as excinfo:
+            NotificationConfig(webhook_url=secret)
+        assert "pa55w0rd" not in str(excinfo.value)
+
+
+class TestNotifierQuoting:
+    """Defence in depth: send() accepts an arbitrary title/body."""
+
+    def test_powershell_quote_doubles_single_quotes(self) -> None:
+        assert monitor.WinToastNotifier._quote("it's") == "it''s"
+
+    def test_powershell_injection_cannot_escape_literal(self) -> None:
+        runner = FixtureCommandRunner([], default=result(""))
+        evil = "'; Remove-Item C:\\ -Recurse -Force; '"
+        monitor.WinToastNotifier(runner).send("Docker disk CRITICAL", evil, "critical")
+
+        script = runner.calls[0][-1]
+        # The payload is embedded with every quote doubled, so it stays data.
+        assert "'" + evil.replace("'", "''") + "'" in script
+        # Balanced quotes => no string literal was terminated early.
+        assert script.count("'") % 2 == 0
+
+    def test_applescript_quote_escapes_quotes_and_backslashes(self) -> None:
+        assert OsaScriptNotifier._quote('a"b') == 'a\\"b'
+        assert OsaScriptNotifier._quote("a\\b") == "a\\\\b"
+
+    def test_quote_flattens_newlines(self) -> None:
+        assert "\n" not in OsaScriptNotifier._quote("line1\nline2")
+        assert "\r" not in OsaScriptNotifier._quote("line1\r\nline2")
+
+    def test_malicious_volume_name_cannot_break_out(self) -> None:
+        from docker_disk_toolkit.utils import CommandResult, FixtureCommandRunner
+
+        runner = FixtureCommandRunner([], default=CommandResult(["osascript"], 0, "", "", 0.0))
+        evil = 'x" with title "pwned" ignoring application responses --'
+        OsaScriptNotifier(runner).send("Docker disk CRITICAL", evil, "critical")
+
+        script = runner.calls[0][-1]
+        # Exactly two unescaped quote pairs remain: the body and the title.
+        unescaped = script.replace('\\"', "")
+        assert unescaped.count('"') == 4
+        assert "ignoring application responses" not in unescaped.split('"')[0]

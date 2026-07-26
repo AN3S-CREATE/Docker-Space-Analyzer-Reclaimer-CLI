@@ -10,6 +10,7 @@ Y``) run against SQLite.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import statistics
 import time
@@ -19,7 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from .models import CleanupResult, TrendStats
-from .utils import atomic_write_text  # noqa: F401  (re-exported convenience)
+from .utils import (  # noqa: F401  (atomic_write_text re-exported for convenience)
+    atomic_write_text,
+    ensure_private_dir,
+    file_lock,
+)
 
 # How long a writer waits for a competing writer before giving up. Scheduled
 # and interactive runs routinely overlap on a busy host.
@@ -89,9 +94,13 @@ def record_run(
     """Append a run summary to JSONL and upsert it into the SQLite index."""
     ts = ts or datetime.now(UTC)
     record = _summary_line(result, command=command, ts=ts)
-    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    with jsonl_path.open("a", encoding="utf-8") as handle:
+    ensure_private_dir(jsonl_path.parent)
+    # The JSONL is the durable source of truth, so the append is locked against
+    # concurrent scheduled/interactive runs before the disposable index update.
+    with file_lock(jsonl_path), jsonl_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     with closing(_connect(db_path)) as conn:
         _upsert(conn, record)
 
@@ -127,7 +136,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     ``busy_timeout``: without it SQLite raises ``database is locked``
     immediately rather than waiting for the other writer to commit.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(db_path.parent)
     conn = sqlite3.connect(db_path, timeout=_BUSY_TIMEOUT_S)
     conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_S * 1000)}")
     _initialise(conn)

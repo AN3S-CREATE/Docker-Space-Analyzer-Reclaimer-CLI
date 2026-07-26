@@ -7,6 +7,10 @@ the CommandRunner fixture seam.
 
 from __future__ import annotations
 
+import os
+import stat
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -234,6 +238,100 @@ class TestPathAndEnvHelpers:
             monkeypatch.delenv(var, raising=False)
         candidates = utils._system_dir_candidates(windows=True)
         assert candidates == ["C:/Windows", "C:/Program Files", "C:/Program Files (x86)"]
+
+
+class TestEnsurePrivateDir:
+    def test_creates_nested_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "reports" / "nested"
+        assert utils.ensure_private_dir(target) == target
+        assert target.is_dir()
+
+    def test_is_idempotent(self, tmp_path: Path) -> None:
+        target = tmp_path / "reports"
+        utils.ensure_private_dir(target)
+        (target / "keep.txt").write_text("data", encoding="utf-8")
+        utils.ensure_private_dir(target)
+        assert (target / "keep.txt").read_text(encoding="utf-8") == "data"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not meaningful on Windows")
+    def test_mode_is_owner_only(self, tmp_path: Path) -> None:
+        target = utils.ensure_private_dir(tmp_path / "reports")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not meaningful on Windows")
+    def test_existing_loose_directory_is_tightened(self, tmp_path: Path) -> None:
+        target = tmp_path / "reports"
+        target.mkdir(mode=0o755)
+        utils.ensure_private_dir(target)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+class TestFileLock:
+    def test_lock_is_reentrant_across_sequential_uses(self, tmp_path: Path) -> None:
+        target = tmp_path / "audit.jsonl"
+        for _ in range(3):
+            with utils.file_lock(target):
+                target.write_text("x", encoding="utf-8")
+        assert target.read_text(encoding="utf-8") == "x"
+
+    def test_lock_creates_sidecar_not_touching_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "audit.jsonl"
+        target.write_text("original\n", encoding="utf-8")
+        with utils.file_lock(target):
+            pass
+        assert target.read_text(encoding="utf-8") == "original\n"
+        assert (tmp_path / "audit.jsonl.lock").exists()
+
+    def test_lock_creates_missing_parent_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "nested" / "deep" / "audit.jsonl"
+        with utils.file_lock(target):
+            pass
+        assert target.parent.is_dir()
+
+    def test_lock_serialises_threads(self, tmp_path: Path) -> None:
+        """Overlapping holders must never be inside the critical section together."""
+        target = tmp_path / "audit.jsonl"
+        concurrent = 0
+        max_seen = 0
+        guard = threading.Lock()
+
+        def worker() -> None:
+            nonlocal concurrent, max_seen
+            for _ in range(5):
+                with utils.file_lock(target):
+                    with guard:
+                        concurrent += 1
+                        max_seen = max(max_seen, concurrent)
+                    time.sleep(0.002)
+                    with guard:
+                        concurrent -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert max_seen == 1, f"{max_seen} writers were inside the lock at once"
+
+    def test_lock_timeout_raises(self, tmp_path: Path) -> None:
+        target = tmp_path / "audit.jsonl"
+        released = threading.Event()
+        acquired = threading.Event()
+
+        def holder() -> None:
+            with utils.file_lock(target):
+                acquired.set()
+                released.wait(timeout=10)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        try:
+            assert acquired.wait(timeout=10)
+            with pytest.raises(utils.FileLockTimeout), utils.file_lock(target, timeout_s=0.2):
+                pass
+        finally:
+            released.set()
+            thread.join(timeout=10)
 
     def test_atomic_write(self, tmp_path: Path) -> None:
         target = tmp_path / "nested" / "out.txt"

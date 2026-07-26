@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.request
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -152,8 +153,23 @@ class OsaScriptNotifier(_RunnerNotifier):
 
         return shutil.which("osascript") is not None
 
+    @staticmethod
+    def _quote(value: str) -> str:
+        """Escape ``value`` for embedding in an AppleScript string literal.
+
+        Today's breach messages only interpolate mountpoints and numbers, so
+        this is defence in depth rather than a live exploit. It matters because
+        :meth:`send` takes an arbitrary title/body: any future caller that
+        passes a Docker object name (which anyone able to create a volume
+        chooses) would otherwise be able to terminate the literal and append
+        further AppleScript. The argv is passed without a shell, so the blast
+        radius is the AppleScript statement, not the shell.
+        """
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return escaped.replace("\r", " ").replace("\n", " ")
+
     def send(self, title: str, body: str, urgency: str) -> bool:
-        script = f'display notification "{body}" with title "{title}"'
+        script = f'display notification "{self._quote(body)}" ' f'with title "{self._quote(title)}"'
         res = self._runner.run(["osascript", "-e", script], timeout=10)
         return res.ok
 
@@ -166,16 +182,105 @@ class WinToastNotifier(_RunnerNotifier):
     def available(self) -> bool:
         return system_info.is_windows() or is_wsl()
 
+    @staticmethod
+    def _quote(value: str) -> str:
+        """Escape ``value`` for a PowerShell single-quoted string literal.
+
+        Higher stakes than the AppleScript equivalent: this string is handed to
+        ``powershell -Command``, so terminating the literal would yield
+        arbitrary PowerShell execution rather than a malformed notification.
+        Inside single quotes PowerShell treats everything literally, and a
+        quote is escaped by doubling it.
+        """
+        return value.replace("'", "''").replace("\r", " ").replace("\n", " ")
+
     def send(self, title: str, body: str, urgency: str) -> bool:
         powershell = "powershell.exe" if is_wsl() else "powershell"
         script = (
             "[reflection.assembly]::loadwithpartialname('System.Windows.Forms') | Out-Null; "
             "$n = New-Object System.Windows.Forms.NotifyIcon; "
             "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
-            f"$n.ShowBalloonTip(10000, '{title}', '{body}', 'Warning')"
+            f"$n.ShowBalloonTip(10000, '{self._quote(title)}', '{self._quote(body)}', 'Warning')"
         )
         res = self._runner.run([powershell, "-NoProfile", "-Command", script], timeout=15)
         return res.ok
+
+
+WEBHOOK_TIMEOUT_S = 10.0
+WEBHOOK_ATTEMPTS = 3
+_WEBHOOK_BACKOFF_S = 0.5
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the payload cannot be replayed to another host."""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class WebhookNotifier(Notifier):
+    """POST a JSON alert to an operator-configured webhook.
+
+    Built on :mod:`urllib` rather than a new HTTP dependency: this is a
+    single fire-and-forget POST and the toolkit is deliberately light.
+
+    The URL is a :class:`~pydantic.SecretStr` and is **never** logged — a Slack
+    or Teams webhook URL is itself the credential. Failures are logged without
+    it and swallowed, because :class:`CompositeNotifier` guarantees the log sink
+    still records the alert.
+    """
+
+    name = "webhook"
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_s: float = WEBHOOK_TIMEOUT_S,
+        attempts: int = WEBHOOK_ATTEMPTS,
+        opener: Callable[..., Any] | None = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._url = url
+        self._timeout_s = timeout_s
+        self._attempts = max(1, attempts)
+        self._opener = opener or urllib.request.build_opener(_NoRedirect).open
+        self._sleep = sleep_fn
+
+    def available(self) -> bool:
+        return bool(self._url)
+
+    def payload(self, title: str, body: str, urgency: str) -> dict[str, Any]:
+        """Build the JSON body. ``text`` keeps Slack/Teams working out of the box."""
+        return {
+            "text": f"{title}: {body}",
+            "title": title,
+            "body": body,
+            "severity": urgency,
+            "source": "docker-disk-toolkit",
+        }
+
+    def send(self, title: str, body: str, urgency: str) -> bool:
+        data = json.dumps(self.payload(title, body, urgency)).encode("utf-8")
+        request = urllib.request.Request(
+            self._url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        for attempt in range(1, self._attempts + 1):
+            try:
+                with self._opener(request, timeout=self._timeout_s) as response:
+                    status = int(getattr(response, "status", 0) or 0)
+                if 200 <= status < 300:
+                    return True
+                _log.warning("webhook_bad_status", status=status, attempt=attempt)
+            except Exception as exc:
+                # Deliberately excludes the URL: it is the credential.
+                _log.warning("webhook_failed", error=type(exc).__name__, attempt=attempt)
+            if attempt < self._attempts:
+                self._sleep(_WEBHOOK_BACKOFF_S * attempt)
+        return False
 
 
 class CompositeNotifier(Notifier):
@@ -183,10 +288,17 @@ class CompositeNotifier(Notifier):
 
     name = "composite"
 
-    def __init__(self, primary: Notifier | None, *, desktop_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        primary: Notifier | None,
+        *,
+        desktop_enabled: bool = True,
+        webhook: Notifier | None = None,
+    ) -> None:
         self._primary = primary
         self._log = LogNotifier()
         self._desktop_enabled = desktop_enabled
+        self._webhook = webhook
 
     def available(self) -> bool:
         return True
@@ -198,6 +310,11 @@ class CompositeNotifier(Notifier):
                 delivered = self._primary.send(title, body, urgency)
             except Exception as exc:
                 _log.warning("desktop_notify_failed", notifier=self._primary.name, error=str(exc))
+        if self._webhook is not None:
+            try:
+                delivered = self._webhook.send(title, body, urgency) or delivered
+            except Exception as exc:  # pragma: no cover - WebhookNotifier is total
+                _log.warning("webhook_notify_failed", error=type(exc).__name__)
         # The log sink always runs so a failed toast is never silent.
         self._log.send(title, body, urgency)
         return delivered
@@ -217,7 +334,10 @@ def get_notifier(
         if candidate.available():
             primary = candidate
             break
-    return CompositeNotifier(primary, desktop_enabled=config.desktop)
+    webhook: Notifier | None = None
+    if config.webhook_url is not None:
+        webhook = WebhookNotifier(config.webhook_url.get_secret_value())
+    return CompositeNotifier(primary, desktop_enabled=config.desktop, webhook=webhook)
 
 
 # ---------------------------------------------------------------------------

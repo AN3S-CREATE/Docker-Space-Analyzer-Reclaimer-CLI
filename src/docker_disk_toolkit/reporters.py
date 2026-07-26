@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ from .models import (
     SpaceDelta,
 )
 from .templating import render_template
-from .utils import atomic_write_text, humanize_size
+from .utils import atomic_write_text, ensure_private_dir, file_lock, humanize_size
 
 _HEALTH_EMOJI = {
     HealthStatus.HEALTHY: "🟢",
@@ -280,13 +281,19 @@ def write_report(
 
 
 def append_audit(config: ToolkitConfig, events: list[AuditEvent]) -> Path:
-    """Append audit events (one JSON object per line) to the audit log."""
+    """Append audit events (one JSON object per line) to the audit log.
+
+    Held under an exclusive lock for the whole batch: a run emits many events
+    and a multi-line append is not atomic, so overlapping scheduled and
+    interactive runs would otherwise interleave records into corrupt lines.
+    """
     path = config.audit_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
+    ensure_private_dir(path.parent)
+    with file_lock(path), path.open("a", encoding="utf-8") as handle:
         for event in events:
             handle.write(event.model_dump_json() + "\n")
         handle.flush()
+        os.fsync(handle.fileno())
     return path
 
 

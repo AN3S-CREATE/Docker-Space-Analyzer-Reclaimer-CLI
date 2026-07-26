@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from docker_disk_toolkit import cli, system_info
 from docker_disk_toolkit.context import RunContext
 from docker_disk_toolkit.docker_client import CliDockerClient, FakeDockerClient, NullDockerClient
+from docker_disk_toolkit.errors import ConfigError, ExitCode
 from docker_disk_toolkit.models import (
     BuildCacheInfo,
     CategoryUsage,
@@ -305,6 +306,53 @@ class TestOtherCommands:
             ],
         )
         assert result.exit_code in (0, 1)
+
+
+class TestExitCodeContract:
+    """Every terminal outcome must be one of the four documented exit codes.
+
+    These matter most under cron/systemd, where the exit code is the only
+    signal: a crash that exits 1 is indistinguishable from a successful
+    cleanup, and a typo that exits 2 looks like a breached threshold.
+    """
+
+    def test_unexpected_exception_is_fatal_not_warning(self, monkeypatch) -> None:
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated internal failure")
+
+        monkeypatch.setattr(cli, "run_analyze", boom)
+        result = runner.invoke(cli.app, ["analyze", "--no-write"])
+        assert result.exit_code == int(ExitCode.FATAL)
+        assert result.exit_code != int(ExitCode.WARNING_CLEANED)
+
+    def test_unexpected_exception_renders_panel_not_traceback(self, monkeypatch) -> None:
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated internal failure")
+
+        monkeypatch.setattr(cli, "run_analyze", boom)
+        result = runner.invoke(cli.app, ["analyze", "--no-write"])
+        assert "Traceback (most recent call last)" not in result.output
+
+    def test_toolkit_error_keeps_its_own_exit_code(self, monkeypatch) -> None:
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise ConfigError("bad config", remediation="fix it")
+
+        monkeypatch.setattr(cli, "run_analyze", boom)
+        result = runner.invoke(cli.app, ["analyze", "--no-write"])
+        assert result.exit_code == int(ConfigError.exit_code)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["analyze", "--no-such-flag"], ["no-such-command"], ["cleanup", "--level", "nine"]],
+    )
+    def test_usage_errors_are_fatal_not_critical(self, argv: list[str]) -> None:
+        result = runner.invoke(cli.app, argv)
+        assert result.exit_code == int(ExitCode.FATAL)
+        assert result.exit_code != int(ExitCode.CRITICAL)
+
+    def test_help_still_exits_zero(self) -> None:
+        assert runner.invoke(cli.app, ["--help"]).exit_code == 0
+        assert runner.invoke(cli.app, ["cleanup", "--help"]).exit_code == 0
 
 
 # ---------------------------------------------------------------------------

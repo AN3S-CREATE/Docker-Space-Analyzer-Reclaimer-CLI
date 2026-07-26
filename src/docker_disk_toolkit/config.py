@@ -16,6 +16,7 @@ import os
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 from platformdirs import user_config_dir
@@ -86,14 +87,40 @@ class Thresholds(BaseModel):
 
 
 class NotificationConfig(BaseModel):
-    """Watchdog notification preferences."""
+    """Watchdog notification preferences.
 
-    model_config = ConfigDict(extra="forbid")
+    ``hide_input_in_errors`` matters here: a webhook URL is itself a credential
+    (Slack/Teams URLs embed the token), and Pydantic otherwise appends the
+    rejected input to the error message, printing the secret to the terminal
+    and the logs.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     enabled: bool = False
     on_events: set[HealthStatus] = Field(default_factory=lambda: {HealthStatus.CRITICAL})
     webhook_url: SecretStr | None = None
     desktop: bool = True
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _validate_webhook_url(cls, value: SecretStr | None) -> SecretStr | None:
+        """Reject anything that is not an absolute http(s) URL.
+
+        ``urllib`` also speaks ``file://`` and ``ftp://``; restricting the
+        scheme here means a malformed or hostile config fails loudly at load
+        time rather than at the moment an alert needs to go out.
+        """
+        if value is None:
+            return None
+        raw = value.get_secret_value().strip()
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            # The message must not echo the URL: it is itself the credential.
+            raise ValueError(
+                "notifications.webhook_url must be an absolute http:// or https:// URL"
+            )
+        return SecretStr(raw)
 
 
 class DockerConfig(BaseModel):
