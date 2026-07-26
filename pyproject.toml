@@ -79,6 +79,7 @@ include = [
     "scripts",
     "docs",
     "README.md",
+    "LICENSE",
     "Makefile",
 ]
 

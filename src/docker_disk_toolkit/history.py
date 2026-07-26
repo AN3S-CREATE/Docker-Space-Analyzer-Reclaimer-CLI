@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import statistics
+import time
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,27 +21,39 @@ from typing import Any
 from .models import CleanupResult, TrendStats
 from .utils import atomic_write_text  # noqa: F401  (re-exported convenience)
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY,
-    ts TEXT NOT NULL,
-    command TEXT NOT NULL,
-    level INTEGER,
-    dry_run INTEGER NOT NULL,
-    freed_bytes INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS deletions (
-    run_id TEXT NOT NULL,
-    ts TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    object_id TEXT,
-    reclaim_bytes INTEGER NOT NULL DEFAULT 0,
-    outcome TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_runs_ts ON runs(ts);
-CREATE INDEX IF NOT EXISTS idx_deletions_ts ON deletions(ts);
-CREATE INDEX IF NOT EXISTS idx_deletions_kind ON deletions(kind);
-"""
+# How long a writer waits for a competing writer before giving up. Scheduled
+# and interactive runs routinely overlap on a busy host.
+_BUSY_TIMEOUT_S = 10.0
+_RETRY_SLEEP_S = 0.05
+
+# Individual statements rather than one ``executescript`` blob: executescript
+# issues an implicit COMMIT and takes a write lock for the whole batch, which
+# is precisely what collides when two runs initialise the database at once.
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        command TEXT NOT NULL,
+        level INTEGER,
+        dry_run INTEGER NOT NULL,
+        freed_bytes INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS deletions (
+        run_id TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        object_id TEXT,
+        reclaim_bytes INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_runs_ts ON runs(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_deletions_ts ON deletions(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_deletions_kind ON deletions(kind)",
+)
 
 
 def _summary_line(result: CleanupResult, *, command: str, ts: datetime) -> dict[str, Any]:
@@ -83,11 +96,41 @@ def record_run(
         _upsert(conn, record)
 
 
+def _initialise(conn: sqlite3.Connection) -> None:
+    """Apply pragmas and DDL, tolerating a concurrent initialiser.
+
+    Enabling WAL and creating tables both need a write lock, and for those
+    SQLite answers ``SQLITE_BUSY`` *without* consulting the busy handler — so
+    ``busy_timeout`` alone does not prevent a crash when a scheduled run and an
+    interactive run open a fresh database simultaneously. Retrying briefly lets
+    the loser observe the winner's schema instead of failing the run.
+    """
+    deadline = time.monotonic() + _BUSY_TIMEOUT_S
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            for statement in _SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            conn.commit()
+            return
+        except sqlite3.OperationalError:
+            conn.rollback()
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_RETRY_SLEEP_S)
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
+    """Open the history index, creating the schema if needed.
+
+    A scheduled run and an interactive run can overlap, so the connection sets
+    ``busy_timeout``: without it SQLite raises ``database is locked``
+    immediately rather than waiting for the other writer to commit.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
+    conn = sqlite3.connect(db_path, timeout=_BUSY_TIMEOUT_S)
+    conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_S * 1000)}")
+    _initialise(conn)
     return conn
 
 

@@ -21,8 +21,8 @@ env/
 coverage.xml
 htmlcov/
 
-# uv
-uv.lock
+# uv — the lockfile IS committed. This is an application, not a library, so a
+# pinned, reproducible dependency set is the point. Do not re-add uv.lock here.
 
 # Editor / OS
 .vscode/

@@ -178,6 +178,63 @@ class TestPathAndEnvHelpers:
         assert not utils.is_safe_output_path(Path("/"))
         assert utils.is_safe_output_path(tmp_path / "reports")
 
+    def test_system_dirs_are_absolute_and_resolved(self) -> None:
+        """Regression guard for the membership test silently never matching.
+
+        ``is_safe_output_path`` compares a *resolved* candidate against this
+        set, so an unresolved entry (e.g. ``Path("/etc")`` on Windows, which is
+        drive-less) can never match and the guard becomes a no-op.
+        """
+        assert utils._SYSTEM_DIRS, "system-dir set must never be empty"
+        for system_dir in utils._SYSTEM_DIRS:
+            assert system_dir.is_absolute()
+            assert system_dir == system_dir.resolve()
+
+    def test_safe_output_path_rejects_any_filesystem_root(self, tmp_path: Path) -> None:
+        """Roots are detected structurally, so every drive letter is covered.
+
+        The previous implementation enumerated only ``C:\\``, leaving ``D:\\``
+        and every other volume accepted.
+        """
+        assert not utils.is_safe_output_path(Path(tmp_path.anchor))
+
+    def test_safe_output_path_rejects_system_dirs_and_their_children(self) -> None:
+        for system_dir in utils._SYSTEM_DIRS:
+            assert not utils.is_safe_output_path(system_dir)
+            assert not utils.is_safe_output_path(system_dir / "docker-disk-reports")
+
+    def test_safe_output_path_allows_ordinary_locations(self, tmp_path: Path) -> None:
+        assert utils.is_safe_output_path(tmp_path / "reports")
+        assert utils.is_safe_output_path(Path("~/docker-disk-reports"))
+
+    def test_safe_output_path_rejects_unresolvable(self) -> None:
+        assert not utils.is_safe_output_path(Path("reports") / ".." / ".." / "..")
+
+    def test_posix_candidates_cover_the_system_tree(self) -> None:
+        """Branch selection is asserted purely; the POSIX filesystem behaviour
+        itself is exercised by the Linux CI job."""
+        candidates = utils._system_dir_candidates(windows=False)
+        assert {"/etc", "/usr", "/bin", "/sbin", "/boot", "/sys", "/proc", "/dev"} <= set(
+            candidates
+        )
+        # /var and %ProgramData% stay writable for service deployments.
+        assert "/var" not in candidates
+
+    def test_windows_candidates_follow_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SYSTEMROOT", r"E:\CustomWindows")
+        candidates = utils._system_dir_candidates(windows=True)
+        assert r"E:\CustomWindows" in candidates
+
+    def test_windows_candidates_fall_back_without_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for var in ("SYSTEMROOT", "WINDIR", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            monkeypatch.delenv(var, raising=False)
+        candidates = utils._system_dir_candidates(windows=True)
+        assert candidates == ["C:/Windows", "C:/Program Files", "C:/Program Files (x86)"]
+
     def test_atomic_write(self, tmp_path: Path) -> None:
         target = tmp_path / "nested" / "out.txt"
         utils.atomic_write_text(target, "hello")
