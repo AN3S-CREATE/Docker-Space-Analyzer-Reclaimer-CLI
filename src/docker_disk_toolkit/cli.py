@@ -157,7 +157,7 @@ def main(
     protect: list[str] | None = typer.Option(None, "--protect", help="Protect volume pattern(s)."),
     min_free_gb: float | None = typer.Option(None, "--min-free-gb", help="Min free GB threshold."),
     max_docker_percent: float | None = typer.Option(
-        None, "--max-docker-percent", help="Max Docker %% of host disk."
+        None, "--max-docker-percent", help="Max Docker % of host disk."
     ),
     log_json: bool = typer.Option(False, "--log-json", help="Structured JSON logs."),
 ) -> None:

@@ -392,25 +392,69 @@ def safe_percent(part: float, whole: float) -> float:
 # Path & environment helpers
 # ---------------------------------------------------------------------------
 
-_SYSTEM_ROOTS = {
-    Path("/"),
-    Path("/etc"),
-    Path("/usr"),
-    Path("/bin"),
-    Path("/boot"),
-    Path("/sys"),
-    Path("/proc"),
-    Path("C:\\"),
-    Path("C:\\Windows"),
-    Path("C:\\Windows\\System32"),
-}
+
+def _system_dir_candidates(*, windows: bool) -> list[str]:
+    """Return the raw protected-directory list for the given platform.
+
+    Kept pure (strings in, strings out) so branch selection is testable from
+    either host without constructing platform-specific :class:`Path` objects.
+
+    Only genuinely system-owned directories are listed. Locations a service may
+    legitimately write to (``/var``, ``%ProgramData%``) are deliberately
+    excluded so a systemd/Task-Scheduler deployment is not blocked.
+    """
+    if windows:
+        # ``os.environ`` upper-cases keys on Windows, so these match regardless
+        # of how the variable is spelled in the parent environment.
+        return [
+            os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or "C:/Windows",
+            os.environ.get("PROGRAMFILES") or "C:/Program Files",
+            os.environ.get("PROGRAMFILES(X86)") or "C:/Program Files (x86)",
+        ]
+    return ["/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/sys", "/proc", "/dev"]
+
+
+def _resolve_system_dirs() -> frozenset[Path]:
+    """Resolve the platform's protected system directories once, at import.
+
+    Entries **must** be resolved, because :func:`is_safe_output_path` compares
+    them against a resolved candidate. Storing them unresolved silently
+    disables the guard on Windows, where ``Path("/").resolve()`` yields the
+    *current drive* root (``D:\\``) rather than ``\\``.
+
+    Resolution also follows symlinks, so a distro where ``/lib`` points at
+    ``/usr/lib`` is still matched correctly.
+    """
+    dirs: set[Path] = set()
+    for entry in _system_dir_candidates(windows=os.name == "nt"):
+        try:
+            dirs.add(Path(entry).resolve())
+        except (OSError, RuntimeError):  # pragma: no cover - hostile environment
+            continue
+    return frozenset(dirs)
+
+
+# Non-empty on every supported platform; asserted by the test suite, because an
+# empty set would silently downgrade the guard to "roots only".
+_SYSTEM_DIRS: frozenset[Path] = _resolve_system_dirs()
 
 
 def is_safe_output_path(path: Path) -> bool:
     """Return ``True`` if ``path`` is a sane place to write reports.
 
-    Rejects unresolved traversal (``..``) and well-known system roots so a
+    Rejects, in order: unresolved traversal (``..``), any filesystem root, and
+    the platform's system directories *including everything beneath them*, so a
     misconfigured ``report_dir`` can never target a critical location.
+
+    Filesystem roots are detected structurally (``resolved.parent == resolved``)
+    rather than by enumeration, so every drive letter and UNC share is covered
+    instead of only ``C:``.
+
+    Examples:
+        >>> is_safe_output_path(Path("reports/../.."))
+        False
+        >>> is_safe_output_path(Path("/"))
+        False
     """
     if any(part == ".." for part in path.parts):
         return False
@@ -418,7 +462,9 @@ def is_safe_output_path(path: Path) -> bool:
         resolved = path.expanduser().resolve()
     except (OSError, RuntimeError):
         return False
-    return resolved not in _SYSTEM_ROOTS
+    if resolved.parent == resolved:  # "/", "C:\\", "D:\\", "\\\\server\\share"
+        return False
+    return not any(resolved.is_relative_to(system_dir) for system_dir in _SYSTEM_DIRS)
 
 
 def is_wsl() -> bool:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -110,3 +112,39 @@ class TestRebuildIndex:
             encoding="utf-8",
         )
         assert history.rebuild_index(jsonl_path=jsonl, db_path=db) == 1
+
+
+class TestConcurrency:
+    """A scheduled run and an interactive run routinely overlap."""
+
+    def test_connection_sets_busy_timeout(self, tmp_path: Path) -> None:
+        _, db = _paths(tmp_path)
+        with closing(history._connect(db)) as conn:
+            timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert timeout_ms >= 1000, "a zero busy_timeout fails instantly under contention"
+
+    def test_concurrent_writers_do_not_raise_database_locked(self, tmp_path: Path) -> None:
+        jsonl, db = _paths(tmp_path)
+        errors: list[BaseException] = []
+
+        def writer(prefix: str) -> None:
+            try:
+                for i in range(10):
+                    history.record_run(
+                        _result(f"{prefix}{i}", 1_000_000),
+                        jsonl_path=jsonl,
+                        db_path=db,
+                        ts=NOW,
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(p,)) for p in ("a", "b", "c")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert not errors, f"concurrent writers raised: {errors!r}"
+        stats = history.trend(db_path=db, window=timedelta(days=30), now=NOW)
+        assert stats.runs == 30
