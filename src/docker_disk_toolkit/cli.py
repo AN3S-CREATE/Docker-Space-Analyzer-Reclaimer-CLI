@@ -87,7 +87,7 @@ class _BoundaryGroup(TyperGroup):
     def invoke(self, ctx: Any) -> Any:
         try:
             return super().invoke(ctx)
-        except (_Exit, _Abort):
+        except (_Exit, _Abort, typer.Exit, typer.Abort):
             raise  # deliberate control flow carrying its own code
         except _UsageError as exc:
             exc.show()
